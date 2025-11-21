@@ -8,11 +8,11 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from webdriver_manager.chrome import ChromeDriverManager
-from selenium_stealth import stealth
 import time
 import os
 from typing import Optional
 import logging
+import re
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 app = FastAPI(
     title="Lazada Price Scraper API",
     description="API untuk scraping harga produk dari Lazada",
-    version="1.0.0"
+    version="2.0.0"
 )
 
 # CORS middleware
@@ -47,34 +47,47 @@ class ScrapeResponse(BaseModel):
     execution_time: float
 
 def setup_driver():
-    """Setup Chrome driver untuk Render.com tanpa install system packages"""
+    """Setup Chrome driver untuk Render.com"""
     chrome_options = Options()
     
-    # Options untuk Render.com
-    chrome_options.add_argument("--headless")
+    # Options untuk production
+    chrome_options.add_argument("--headless=new")  # New headless mode
     chrome_options.add_argument("--no-sandbox")
     chrome_options.add_argument("--disable-dev-shm-usage")
     chrome_options.add_argument("--disable-gpu")
     chrome_options.add_argument("--window-size=1920,1080")
     chrome_options.add_argument("--disable-extensions")
-    chrome_options.add_argument("--disable-images")
+    chrome_options.add_argument("--disable-blink-features=AutomationControlled")
+    chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
+    chrome_options.add_experimental_option('useAutomationExtension', False)
+    
+    # User agent realistic
     chrome_options.add_argument("--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
     
-    # Gunakan webdriver-manager untuk auto-download ChromeDriver
+    # Gunakan webdriver-manager
     service = Service(ChromeDriverManager().install())
     driver = webdriver.Chrome(service=service, options=chrome_options)
     
-    # Apply stealth settings
-    stealth(driver,
-        languages=["en-US", "en"],
-        vendor="Google Inc.",
-        platform="Win32",
-        webgl_vendor="Intel Inc.",
-        renderer="Intel Iris OpenGL Engine",
-        fix_hairline=True,
-    )
+    # Execute script to hide automation
+    driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
     
     return driver
+
+def extract_price_from_text(text):
+    """Extract price from text using regex"""
+    # Pattern untuk harga Indonesia: Rp 240.000 atau 240.000
+    patterns = [
+        r'Rp\s*(\d{1,3}(?:\.\d{3})*(?:,\d{2})?)',
+        r'(\d{1,3}(?:\.\d{3})*(?:,\d{2})?)\s*Rp',
+        r'\b(\d{1,3}(?:\.\d{3})+)\b'
+    ]
+    
+    for pattern in patterns:
+        matches = re.findall(pattern, text)
+        for match in matches:
+            if match and '.' in match:  # Pastikan format ada titik (240.000)
+                return f"Rp {match}"
+    return None
 
 def scrape_lazada_price(url: str, timeout: int = 30):
     """Function utama untuk scraping harga Lazada"""
@@ -87,13 +100,12 @@ def scrape_lazada_price(url: str, timeout: int = 30):
         
         # Set timeouts
         driver.set_page_load_timeout(timeout)
-        driver.implicitly_wait(10)
         
         # Buka URL
         logger.info("Membuka URL...")
         driver.get(url)
         
-        # Tunggu sampai page fully loaded
+        # Tunggu page load
         time.sleep(5)
         
         result = {
@@ -103,30 +115,32 @@ def scrape_lazada_price(url: str, timeout: int = 30):
             'discount': None
         }
         
-        # 1. Cari harga dengan multiple strategies
-        logger.info("Mencari harga...")
+        # Strategy 1: Cari dengan CSS Selectors
+        logger.info("Strategy 1: Mencari dengan CSS Selectors...")
         
-        # Strategy 1: CSS Selectors
         price_selectors = [
             "span.pdp-price",
-            ".pdp-product-price",
+            ".pdp-product-price", 
             "span.pdp-v2-price",
             ".final-price",
             "[data-spm*='price']",
             "span[class*='price']",
-            "div[class*='price']"
+            "div[class*='price']",
+            # Lazada specific selectors
+            ".pdp-mod-product-price",
+            ".pdp-product-price span",
+            ".pdp-v2-product-price-content-salePrice-amount"
         ]
         
         for selector in price_selectors:
             try:
                 elements = driver.find_elements(By.CSS_SELECTOR, selector)
                 for element in elements:
-                    price_text = element.text.strip()
-                    if price_text and any(char.isdigit() for char in price_text):
-                        # Clean price text
-                        cleaned_price = price_text.replace('Rp', '').replace(' ', '').strip()
-                        if '.' in cleaned_price or ',' in cleaned_price:
-                            result['price'] = f"Rp {cleaned_price}"
+                    text = element.text.strip()
+                    if text and any(char.isdigit() for char in text):
+                        price = extract_price_from_text(text)
+                        if price:
+                            result['price'] = price
                             logger.info(f"Harga ditemukan via CSS: {result['price']}")
                             break
                 if result['price']:
@@ -134,10 +148,12 @@ def scrape_lazada_price(url: str, timeout: int = 30):
             except Exception as e:
                 continue
         
-        # Strategy 2: XPath
+        # Strategy 2: Cari dengan XPath
         if not result['price']:
+            logger.info("Strategy 2: Mencari dengan XPath...")
             xpath_selectors = [
                 "//span[contains(text(), 'Rp')]",
+                "//div[contains(text(), 'Rp')]",
                 "//*[contains(text(), 'Rp')]",
                 "//span[contains(@class, 'price')]",
                 "//div[contains(@class, 'price')]"
@@ -147,68 +163,80 @@ def scrape_lazada_price(url: str, timeout: int = 30):
                 try:
                     elements = driver.find_elements(By.XPATH, xpath)
                     for element in elements:
-                        price_text = element.text.strip()
-                        if price_text and any(char.isdigit() for char in price_text):
-                            result['price'] = price_text
-                            logger.info(f"Harga ditemukan via XPath: {result['price']}")
-                            break
+                        text = element.text.strip()
+                        if text and any(char.isdigit() for char in text):
+                            price = extract_price_from_text(text)
+                            if price:
+                                result['price'] = price
+                                logger.info(f"Harga ditemukan via XPath: {result['price']}")
+                                break
                     if result['price']:
                         break
                 except:
                     continue
         
-        # 2. Cari nama produk
-        logger.info("Mencari nama produk...")
+        # Strategy 3: Regex search di page source
+        if not result['price']:
+            logger.info("Strategy 3: Regex search di page source...")
+            page_source = driver.page_source
+            price_patterns = [
+                r'Rp\s*(\d{1,3}(?:\.\d{3})+)',
+                r'(\d{1,3}(?:\.\d{3})+)\s*Rp',
+                r'["\']price["\']\s*:\s*["\']([^"\']+)["\']',
+                r'["\']salePrice["\']\s*:\s*["\']([^"\']+)["\']'
+            ]
+            
+            for pattern in price_patterns:
+                matches = re.findall(pattern, page_source)
+                for match in matches:
+                    if match and '.' in match:
+                        result['price'] = f"Rp {match}"
+                        logger.info(f"Harga ditemukan via regex: {result['price']}")
+                        break
+                if result['price']:
+                    break
+        
+        # Cari nama produk
         name_selectors = [
             "h1.pdp-mod-product-badge-title",
             ".pdp-product-title",
             "h1.pdp-title",
             "title",
-            "h1"
+            "h1",
+            ".pdp-mod-product-name"
         ]
         
         for selector in name_selectors:
             try:
                 element = driver.find_element(By.CSS_SELECTOR, selector)
-                name_text = element.text.strip()
-                if name_text and len(name_text) > 5:
-                    result['product_name'] = name_text
-                    logger.info(f"Nama produk ditemukan: {result['product_name']}")
+                name = element.text.strip()
+                if name and len(name) > 5:
+                    result['product_name'] = name
                     break
             except:
                 continue
         
-        # 3. Cari harga original
+        # Cari harga original dan discount
         try:
-            original_selectors = [
-                "span.pdp-v2-product-price-content-originalPrice-amount",
-                ".original-price",
-                "[class*='originalPrice']"
-            ]
-            for selector in original_selectors:
-                try:
-                    element = driver.find_element(By.CSS_SELECTOR, selector)
-                    result['original_price'] = element.text.strip()
+            # Cari elemen yang mengandung "original"
+            original_elements = driver.find_elements(By.XPATH, "//*[contains(@class, 'original') or contains(text(), 'Original')]")
+            for elem in original_elements:
+                text = elem.text.strip()
+                price = extract_price_from_text(text)
+                if price:
+                    result['original_price'] = price
                     break
-                except:
-                    continue
         except:
             pass
         
-        # 4. Cari discount
         try:
-            discount_selectors = [
-                "span.pdp-v2-product-price-content-originalPrice-discount",
-                ".discount",
-                "[class*='discount']"
-            ]
-            for selector in discount_selectors:
-                try:
-                    element = driver.find_element(By.CSS_SELECTOR, selector)
-                    result['discount'] = element.text.strip()
+            # Cari discount
+            discount_elements = driver.find_elements(By.XPATH, "//*[contains(@class, 'discount') or contains(text(), '%')]")
+            for elem in discount_elements:
+                text = elem.text.strip()
+                if '%' in text:
+                    result['discount'] = text
                     break
-                except:
-                    continue
         except:
             pass
         
@@ -216,19 +244,11 @@ def scrape_lazada_price(url: str, timeout: int = 30):
         
         if not result['price']:
             logger.warning("Tidak ada harga yang ditemukan")
-            # Fallback: cari angka yang mirip harga di seluruh page
-            page_text = driver.page_source
-            import re
-            price_matches = re.findall(r'\b\d{1,3}(?:\.\d{3})+\b', page_text)
-            if price_matches:
-                result['price'] = f"Rp {price_matches[0]}"
-                logger.info(f"Harga ditemukan via regex fallback: {result['price']}")
-            else:
-                return {
-                    'success': False,
-                    'error': 'Price not found on the page',
-                    'execution_time': execution_time
-                }
+            return {
+                'success': False,
+                'error': 'Price not found on the page',
+                'execution_time': execution_time
+            }
         
         return {
             'success': True,
@@ -253,20 +273,20 @@ async def root():
     return {
         "message": "Lazada Price Scraper API", 
         "status": "running",
-        "version": "1.0.0",
+        "version": "2.0.0",
         "endpoints": {
-            "scrape": "POST /scrape",
-            "scrape_simple": "GET /scrape-simple?url=URL",
+            "scrape_post": "POST /scrape",
+            "scrape_get": "GET /scrape?url=URL",
             "health": "GET /health"
-        }
+        },
+        "example": "GET /scrape?url=https://www.lazada.co.id/products/your-product-url"
     }
 
 @app.post("/scrape", response_model=ScrapeResponse)
-async def scrape_price(request: ScrapeRequest):
-    """Endpoint utama untuk scraping harga"""
-    logger.info(f"Received request for URL: {request.url}")
+async def scrape_price_post(request: ScrapeRequest):
+    """POST endpoint untuk scraping harga"""
+    logger.info(f"POST request untuk URL: {request.url}")
     
-    # Validasi URL
     if not request.url.startswith(('https://www.lazada.co.id/products/', 'http://www.lazada.co.id/products/')):
         raise HTTPException(
             status_code=400, 
@@ -280,16 +300,16 @@ async def scrape_price(request: ScrapeRequest):
     
     return result
 
-@app.get("/scrape-simple")
-async def scrape_simple(url: str):
-    """Simple GET endpoint untuk scraping"""
+@app.get("/scrape")
+async def scrape_price_get(url: str, timeout: int = 30):
+    """GET endpoint untuk scraping harga"""
     if not url:
-        raise HTTPException(status_code=400, detail="URL parameter required")
+        raise HTTPException(status_code=400, detail="Parameter 'url' diperlukan")
     
     if not url.startswith(('https://www.lazada.co.id/products/', 'http://www.lazada.co.id/products/')):
         raise HTTPException(status_code=400, detail="URL harus dari Lazada Indonesia")
     
-    result = scrape_lazada_price(url)
+    result = scrape_lazada_price(url, timeout)
     return result
 
 @app.get("/health")
@@ -298,8 +318,27 @@ async def health_check():
     return {
         "status": "healthy", 
         "service": "Lazada Scraper API",
-        "timestamp": time.time()
+        "timestamp": time.time(),
+        "version": "2.0.0"
     }
+
+# New simple test endpoint
+@app.get("/test")
+async def test_endpoint():
+    """Test endpoint dengan URL contoh"""
+    test_url = "https://www.lazada.co.id/products/prikol-british-klasik-gaya-sepatu-pria-casual-santai-kerja-sepatu-keren-pantofel-loafer-kulit-cowok-sepatu-formal-slip-on-kuliah-160-i6593890539-s12535812627.html"
+    
+    try:
+        result = scrape_lazada_price(test_url, timeout=20)
+        return {
+            "test_result": "success" if result['success'] else "failed",
+            "data": result
+        }
+    except Exception as e:
+        return {
+            "test_result": "error",
+            "error": str(e)
+        }
 
 if __name__ == "__main__":
     import uvicorn

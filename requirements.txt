@@ -3,4 +3,3 @@ uvicorn==0.24.0
 selenium==4.15.0
 webdriver-manager==4.0.1
 pydantic==2.5.0
-selenium-stealth==1.0.6
